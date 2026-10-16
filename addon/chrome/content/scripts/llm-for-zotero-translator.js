@@ -20,14 +20,14 @@ var LlmForZoteroTranslator = (() => {
   const PLUGIN_ID = "llm-for-zotero-translator@cszr";
   const RENDER_TOOLBAR_PROBE_TIMEOUT = 25000;
 
-  // 内置配置（对应 translate_zotero_markdown.py 的 remote_deepseek 档，
-  // 可在 Zotero 偏好设置 extensions.llm-for-zotero-translator.* 中覆盖）
+  // 内置配置。可在「编辑 → 设置 → LLM for Zotero Translator」里管理，
+  // 也可在 Zotero 偏好设置 extensions.llm-for-zotero-translator.* 中直接覆盖。
   const DEFAULTS = {
     mineruRoot: "V:\\Zotero\\llm-for-zotero-mineru", // parser_root
-    // 安全：不再内置 API Key。首次使用请到 Zotero → 编辑 → 首选项 → 高级 → 配置编辑器设置
-    // extensions.llm-for-zotero-translator.apiKey，否则点击翻译会提示缺少 API Key。
-    apiKey: "", // remote_deepseek.api_key
-    baseUrl: "https://api.deepseek.com", // remote_deepseek.base_url
+    // 安全：不再内置 API Key，请在设置面板里填写，否则点击翻译会提示缺少 API Key。
+    apiKey: "",
+    provider: "deepseek", // 见 PROVIDER_PRESETS
+    baseUrl: "", // 留空则使用所选服务商的默认接口地址
     model: "deepseek-v4-flash", // remote_deepseek.model
     maxSegmentChars: 28000, // remote_deepseek.max_segment_chars
     timeout: 180000, // remote_deepseek.timeout = 180s
@@ -37,6 +37,131 @@ var LlmForZoteroTranslator = (() => {
     thinkingDisabled: true, // extra_body.thinking.type = "disabled"
     maxTokens: 12000, // extra_body.max_tokens
   };
+
+  // ---------------------------------------------------------------------------
+  // AI 服务商预设
+  //
+  // 服务商的 id / label 与 llm-for-zotero 插件的「AI 服务商」保持一致，
+  // 这样两个插件里选到的服务商名称完全相同。
+  // 差别只在请求协议：本插件统一走 OpenAI 兼容的 /chat/completions，
+  // 因此 apiBase 取的是各家同一个服务商的 OpenAI 兼容基址
+  // （即 llm-for-zotero 各预设 matches 路径清单里列出的 /chat/completions 路径）。
+  // ---------------------------------------------------------------------------
+  const PROVIDER_PRESETS = [
+    {
+      id: "deepseek",
+      label: "DeepSeek",
+      apiBase: "https://api.deepseek.com",
+      models: ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+      thinkingParam: true, // 支持 thinking:{type:"disabled"}
+    },
+    {
+      id: "openai",
+      label: "OpenAI",
+      apiBase: "https://api.openai.com/v1",
+      models: ["gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o", "gpt-4o-mini", "o4-mini"],
+    },
+    {
+      id: "gemini",
+      label: "Gemini",
+      apiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
+      models: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+    },
+    {
+      id: "anthropic",
+      label: "Anthropic",
+      apiBase: "https://api.anthropic.com/v1",
+      models: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"],
+    },
+    {
+      id: "minimax",
+      label: "MiniMax",
+      apiBase: "https://api.minimax.io/v1",
+      models: ["MiniMax-M2", "MiniMax-Text-01"],
+    },
+    {
+      id: "glm",
+      label: "GLM",
+      apiBase: "https://open.bigmodel.cn/api/paas/v4",
+      models: ["glm-4.6", "glm-4.5", "glm-4.5-air"],
+      thinkingParam: true,
+    },
+    {
+      id: "grok",
+      label: "Grok",
+      apiBase: "https://api.x.ai/v1",
+      models: ["grok-4", "grok-4-fast", "grok-3"],
+    },
+    {
+      id: "qwen",
+      label: "Qwen",
+      apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      models: ["qwen3-max", "qwen-plus", "qwen-turbo"],
+    },
+    {
+      id: "kimi",
+      label: "Kimi",
+      apiBase: "https://api.moonshot.ai/v1",
+      models: ["kimi-k2-turbo-preview", "moonshot-v1-128k"],
+    },
+    {
+      id: "mimo",
+      label: "Xiaomi MiMo",
+      apiBase: "https://api.xiaomimimo.com/v1",
+      models: [],
+    },
+    {
+      id: "siliconflow",
+      label: "SiliconFlow",
+      apiBase: "https://api.siliconflow.cn/v1",
+      models: ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-32B", "zai-org/GLM-4.5"],
+    },
+    {
+      id: "opencode",
+      label: "OpenCode Zen",
+      apiBase: "https://opencode.ai/zen/v1",
+      models: [],
+    },
+    {
+      id: "ollama",
+      label: "Ollama（本地）",
+      apiBase: "http://localhost:11434/v1",
+      models: ["qwen3", "llama3.2", "deepseek-r1"],
+      requiresApiKey: false,
+    },
+    {
+      id: "local_openai",
+      label: "Local（OpenAI 兼容）",
+      apiBase: "http://localhost:1234/v1",
+      models: [],
+      requiresApiKey: false,
+    },
+    {
+      id: "custom",
+      label: "自定义（Custom）",
+      apiBase: "",
+      models: [],
+    },
+  ];
+
+  function getProviderPreset(id) {
+    const key = String(id || "").trim();
+    return (
+      PROVIDER_PRESETS.find((preset) => preset.id === key) ||
+      PROVIDER_PRESETS.find((preset) => preset.id === DEFAULTS.provider) ||
+      PROVIDER_PRESETS[0]
+    );
+  }
+
+  // 接口地址：用户填过就用用户的，否则用服务商预设值
+  function resolveApiBase(providerId, prefBaseUrl) {
+    const preset = getProviderPreset(providerId);
+    const fromPref = String(prefBaseUrl || "").trim().replace(/\/+$/, "");
+    if (fromPref) {
+      return fromPref;
+    }
+    return String(preset.apiBase || "").replace(/\/+$/, "");
+  }
 
   const state = {
     windows: new Map(),
@@ -91,10 +216,15 @@ var LlmForZoteroTranslator = (() => {
   }
 
   function getConfig() {
+    const preset = getProviderPreset(getPref("provider", DEFAULTS.provider));
     return {
       mineruRoot: String(getPref("mineruRoot", DEFAULTS.mineruRoot)),
       apiKey: String(getPref("apiKey", DEFAULTS.apiKey)),
-      baseUrl: String(getPref("baseUrl", DEFAULTS.baseUrl)).replace(/\/+$/, ""),
+      provider: preset.id,
+      providerLabel: preset.label,
+      requiresApiKey: preset.requiresApiKey !== false,
+      usesThinkingParam: !!preset.thinkingParam, // 只有部分服务商支持 thinking 参数
+      baseUrl: resolveApiBase(preset.id, getPref("baseUrl", DEFAULTS.baseUrl)),
       model: String(getPref("model", DEFAULTS.model)),
       maxSegmentChars: Number(getPref("maxSegmentChars", DEFAULTS.maxSegmentChars)) || DEFAULTS.maxSegmentChars,
       timeout: Number(getPref("timeout", DEFAULTS.timeout)) || DEFAULTS.timeout,
@@ -405,7 +535,7 @@ var LlmForZoteroTranslator = (() => {
   }
 
   // ---------------------------------------------------------------------------
-  // DeepSeek API（OpenAI 兼容 /chat/completions）
+  // 翻译请求（OpenAI 兼容 /chat/completions；服务商与模型在「编辑 → 设置」里选择）
   // ---------------------------------------------------------------------------
 
   function fetchWithTimeout(url, options, timeoutMs) {
@@ -434,6 +564,15 @@ var LlmForZoteroTranslator = (() => {
     return key.slice(0, 6) + "***" + key.slice(-4);
   }
 
+  function buildRequestHeaders(config) {
+    const headers = { "Content-Type": "application/json", Accept: "application/json" };
+    // 本地服务商（Ollama / LM Studio 等）通常不需要 API Key，此时不发 Authorization
+    if (config.apiKey) {
+      headers.Authorization = "Bearer " + config.apiKey;
+    }
+    return headers;
+  }
+
   async function requestChatCompletion(messages, config) {
     const url = config.baseUrl + "/chat/completions";
     const body = {
@@ -443,7 +582,8 @@ var LlmForZoteroTranslator = (() => {
       stream: false,
       max_tokens: config.maxTokens,
     };
-    if (config.thinkingDisabled) {
+    // thinking 参数只有部分服务商（DeepSeek / GLM 等）的兼容接口支持，其它服务商不发
+    if (config.thinkingDisabled && config.usesThinkingParam) {
       body.thinking = { type: "disabled" };
     }
 
@@ -454,11 +594,7 @@ var LlmForZoteroTranslator = (() => {
           url,
           {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "application/json",
-              Authorization: "Bearer " + config.apiKey,
-            },
+            headers: buildRequestHeaders(config),
             body: JSON.stringify(body),
           },
           config.timeout,
@@ -703,8 +839,12 @@ var LlmForZoteroTranslator = (() => {
 
   async function runTranslation(item, button) {
     const config = getConfig();
-    if (!config.apiKey) {
-      notify("MinerU 翻译", "缺少 API Key，请设置偏好 " + PREF_BRANCH + "apiKey");
+    if (config.requiresApiKey && !config.apiKey) {
+      notify(
+        "MinerU 翻译",
+        "缺少 API Key：请打开 编辑 → 设置 → LLM for Zotero Translator 填写，" +
+          "或直接设置偏好 " + PREF_BRANCH + "apiKey",
+      );
       return null;
     }
 
@@ -1035,6 +1175,255 @@ var LlmForZoteroTranslator = (() => {
   }
 
   // ---------------------------------------------------------------------------
+  // 「编辑 → 设置」偏好面板
+  // ---------------------------------------------------------------------------
+
+  const PANE_ID = "llm-for-zotero-translator-prefpane";
+  const PANE_SRC = "chrome://llm-for-zotero-translator/content/preferences.xhtml";
+  const PANE_ICON = "chrome://llm-for-zotero-translator/content/icons/icon.png";
+  const PANE_HELP_URL = "https://github.com/Vithrive/llm-for-zotero-translator";
+  const MODEL_REFRESH_TIMEOUT = 20000;
+
+  // 面板里的控件 id（test-preferences.js 也依赖这份映射）
+  const PANE_FIELD = {
+    provider: "lft-provider",
+    providerHint: "lft-provider-hint",
+    baseUrl: "lft-api-base",
+    model: "lft-model",
+    modelList: "lft-model-list",
+    refreshModels: "lft-refresh-models",
+    modelStatus: "lft-model-status",
+    apiKey: "lft-api-key",
+    apiKeyHint: "lft-api-key-hint",
+    mineruRoot: "lft-mineru-root",
+    overwrite: "lft-overwrite",
+    skipReferences: "lft-skip-references",
+  };
+
+  function registerPrefsPane() {
+    const panes = Zotero.PreferencePanes;
+    if (!panes || typeof panes.register !== "function") {
+      log("Zotero.PreferencePanes 不可用，跳过设置面板注册");
+      return Promise.resolve();
+    }
+    return Promise.resolve(
+      panes.register({
+        pluginID: PLUGIN_ID,
+        id: PANE_ID,
+        src: PANE_SRC,
+        label: PLUGIN_NAME,
+        image: PANE_ICON,
+        helpURL: PANE_HELP_URL,
+      }),
+    ).catch((error) => log("注册设置面板失败", error));
+  }
+
+  function setPref(name, value) {
+    try {
+      Zotero.Prefs.set(PREF_BRANCH + name, value, true);
+    } catch (error) {
+      log("写入偏好设置失败: " + name, error);
+    }
+  }
+
+  function createHTMLElement(doc, tagName) {
+    return doc.createElementNS("http://www.w3.org/1999/xhtml", tagName);
+  }
+
+  // 模型候选：写进 <datalist>，输入框仍是自由文本，可填列表外的任意模型名
+  function setModelOptions(doc, datalist, models) {
+    if (!datalist) {
+      return;
+    }
+    datalist.replaceChildren();
+    for (const model of models || []) {
+      const option = createHTMLElement(doc, "option");
+      option.setAttribute("value", model);
+      option.textContent = model;
+      datalist.appendChild(option);
+    }
+  }
+
+  function setPaneStatus(element, text) {
+    if (element) {
+      element.textContent = text || "";
+    }
+  }
+
+  function describeProvider(preset) {
+    if (!preset.apiBase) {
+      return "自定义：请填写 OpenAI 兼容接口基址，例如 http://localhost:8000/v1";
+    }
+    const keyNote = preset.requiresApiKey === false ? "，通常无需 API Key" : "";
+    return "请求地址：" + preset.apiBase + "/chat/completions" + keyNote;
+  }
+
+  // 用服务商自己的 /models 接口拉取模型清单（拿不到就保留预设候选）
+  async function refreshModelList({ doc, datalist, statusEl, baseUrl, apiKey }) {
+    const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+    if (!base) {
+      setPaneStatus(statusEl, "请先填写接口地址");
+      return [];
+    }
+    setPaneStatus(statusEl, "正在获取模型列表…");
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller
+      ? setTimeout(() => controller.abort(), MODEL_REFRESH_TIMEOUT)
+      : null;
+    try {
+      const response = await fetch(base + "/models", {
+        method: "GET",
+        headers: buildRequestHeaders({ apiKey }),
+        signal: controller ? controller.signal : undefined,
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status + " " + String(text).slice(0, 120));
+      }
+      let payload = null;
+      try {
+        payload = JSON.parse(text);
+      } catch (_error) {
+        throw new Error("响应不是合法 JSON");
+      }
+      const raw = Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload?.models)
+          ? payload.models
+          : [];
+      const ids = raw
+        .map((item) => (typeof item === "string" ? item : item?.id || item?.name || ""))
+        .filter(Boolean)
+        .sort();
+      if (!ids.length) {
+        throw new Error("响应里没有模型列表");
+      }
+      setModelOptions(doc, datalist, ids);
+      setPaneStatus(statusEl, "已获取 " + ids.length + " 个模型（点输入框可选）");
+      return ids;
+    } catch (error) {
+      setPaneStatus(statusEl, "获取失败：" + (error?.message || error));
+      return [];
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  function onPrefsLoad(prefWindow) {
+    const doc = prefWindow && prefWindow.document;
+    if (!doc) {
+      return;
+    }
+    const get = (id) => doc.getElementById(id);
+    const providerSelect = get(PANE_FIELD.provider);
+    if (!providerSelect) {
+      return;
+    }
+    const providerHint = get(PANE_FIELD.providerHint);
+    const baseUrlInput = get(PANE_FIELD.baseUrl);
+    const modelInput = get(PANE_FIELD.model);
+    const modelList = get(PANE_FIELD.modelList);
+    const refreshButton = get(PANE_FIELD.refreshModels);
+    const modelStatus = get(PANE_FIELD.modelStatus);
+    const apiKeyInput = get(PANE_FIELD.apiKey);
+    const apiKeyHint = get(PANE_FIELD.apiKeyHint);
+    const mineruRootInput = get(PANE_FIELD.mineruRoot);
+    const overwriteCheckbox = get(PANE_FIELD.overwrite);
+    const skipReferencesCheckbox = get(PANE_FIELD.skipReferences);
+
+    const config = getConfig();
+
+    // 服务商下拉：列表与 llm-for-zotero 的「AI 服务商」一致
+    providerSelect.replaceChildren();
+    for (const preset of PROVIDER_PRESETS) {
+      const option = createHTMLElement(doc, "option");
+      option.setAttribute("value", preset.id);
+      option.textContent = preset.label;
+      providerSelect.appendChild(option);
+    }
+
+    const renderProvider = (preset, writePrefs) => {
+      if (baseUrlInput) {
+        baseUrlInput.value = preset.apiBase || "";
+      }
+      setModelOptions(doc, modelList, preset.models || []);
+      if (providerHint) {
+        providerHint.textContent = describeProvider(preset);
+      }
+      if (apiKeyHint) {
+        apiKeyHint.textContent =
+          preset.requiresApiKey === false
+            ? "该服务商通常不需要 API Key。"
+            : "密钥存放在 Zotero 偏好设置 " + PREF_BRANCH + "apiKey 中（明文存储）。";
+      }
+      if (!writePrefs) {
+        return;
+      }
+      setPref("provider", preset.id);
+      setPref("baseUrl", preset.apiBase || "");
+      const models = preset.models || [];
+      if (models.length) {
+        setPref("model", models[0]);
+        if (modelInput) {
+          modelInput.value = models[0];
+        }
+      }
+    };
+
+    // 初始值：偏好设置里的实测值优先，其次才是预设
+    renderProvider(getProviderPreset(config.provider), false);
+    providerSelect.value = config.provider;
+    if (baseUrlInput) {
+      baseUrlInput.value = config.baseUrl;
+    }
+    if (modelInput) {
+      modelInput.value = config.model;
+    }
+    if (apiKeyInput) {
+      apiKeyInput.value = config.apiKey;
+    }
+    if (mineruRootInput) {
+      mineruRootInput.value = config.mineruRoot;
+    }
+    if (overwriteCheckbox) {
+      overwriteCheckbox.checked = !!config.overwrite;
+    }
+    if (skipReferencesCheckbox) {
+      skipReferencesCheckbox.checked = !!config.skipReferences;
+    }
+
+    providerSelect.addEventListener("change", () => {
+      const preset = getProviderPreset(providerSelect.value);
+      providerSelect.value = preset.id;
+      renderProvider(preset, true);
+      setPaneStatus(modelStatus, "");
+    });
+    baseUrlInput?.addEventListener("change", () =>
+      setPref("baseUrl", String(baseUrlInput.value || "").trim()));
+    modelInput?.addEventListener("change", () =>
+      setPref("model", String(modelInput.value || "").trim()));
+    apiKeyInput?.addEventListener("change", () =>
+      setPref("apiKey", String(apiKeyInput.value || "").trim()));
+    mineruRootInput?.addEventListener("change", () =>
+      setPref("mineruRoot", String(mineruRootInput.value || "").trim()));
+    overwriteCheckbox?.addEventListener("change", () =>
+      setPref("overwrite", !!overwriteCheckbox.checked));
+    skipReferencesCheckbox?.addEventListener("change", () =>
+      setPref("skipReferences", !!skipReferencesCheckbox.checked));
+    refreshButton?.addEventListener("click", () => {
+      refreshModelList({
+        doc,
+        datalist: modelList,
+        statusEl: modelStatus,
+        baseUrl: baseUrlInput ? baseUrlInput.value : config.baseUrl,
+        apiKey: apiKeyInput ? apiKeyInput.value : config.apiKey,
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // 生命周期
   // ---------------------------------------------------------------------------
 
@@ -1044,6 +1433,7 @@ var LlmForZoteroTranslator = (() => {
       Zotero.unlockPromise,
       Zotero.uiReadyPromise,
     ]);
+    registerPrefsPane();
     registerReaderToolbarButton();
     if (!state.intervalID) {
       state.intervalID = setInterval(() => {
@@ -1105,6 +1495,17 @@ var LlmForZoteroTranslator = (() => {
       onMainWindowLoad,
       onMainWindowUnload,
       onShutdown,
+      onPrefsLoad,
+    },
+    // 仅供 tools/ 下的离线自检脚本使用，Zotero 运行时不依赖这些导出
+    _internal: {
+      PROVIDER_PRESETS,
+      PANE_FIELD,
+      getProviderPreset,
+      resolveApiBase,
+      getConfig,
+      requestChatCompletion,
+      refreshModelList,
     },
   };
 })();

@@ -1,0 +1,120 @@
+<vbox
+  id="llm-for-zotero-translator-prefpane"
+  xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+  xmlns:html="http://www.w3.org/1999/xhtml"
+  onload="Zotero.LlmForZoteroTranslator.hooks.onPrefsLoad(this.ownerDocument.defaultView)"
+>
+  <!-- 「编辑 → 设置」里的面板本体：控件全部由主脚本 hooks.onPrefsLoad 读写偏好设置 -->
+  <html:style>
+    #llm-for-zotero-translator-prefpane {
+      padding: 6px 4px 16px;
+      font-size: 13px;
+      color: var(--fill-primary, #1a1a1a);
+    }
+    #llm-for-zotero-translator-prefpane .lft-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin: 0 0 10px;
+    }
+    #llm-for-zotero-translator-prefpane .lft-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 6px 0;
+    }
+    #llm-for-zotero-translator-prefpane .lft-label {
+      flex: 0 0 104px;
+      text-align: right;
+      color: var(--fill-secondary, #5b5b5b);
+    }
+    #llm-for-zotero-translator-prefpane .lft-input,
+    #llm-for-zotero-translator-prefpane .lft-select {
+      flex: 1 1 auto;
+      min-width: 300px;
+      max-width: 460px;
+      padding: 4px 8px;
+      font-size: 13px;
+      color: inherit;
+      background: var(--material-background, #fff);
+      border: 1px solid var(--fill-quinary, #c9c9c9);
+      border-radius: 6px;
+    }
+    #llm-for-zotero-translator-prefpane .lft-hint {
+      margin: 2px 0 8px 112px;
+      font-size: 11px;
+      line-height: 1.5;
+      max-width: 520px;
+      color: var(--fill-secondary, #757575);
+    }
+    #llm-for-zotero-translator-prefpane .lft-status {
+      font-size: 11px;
+      color: var(--fill-secondary, #757575);
+    }
+    #llm-for-zotero-translator-prefpane .lft-button {
+      padding: 4px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #llm-for-zotero-translator-prefpane .lft-check {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 6px 0 6px 112px;
+    }
+  </html:style>
+
+  <groupbox>
+    <html:div class="lft-title">AI 服务商与模型</html:div>
+
+    <html:div class="lft-row">
+      <html:label class="lft-label" for="lft-provider">AI 服务商</html:label>
+      <html:select id="lft-provider" class="lft-select"></html:select>
+    </html:div>
+    <html:div id="lft-provider-hint" class="lft-hint"></html:div>
+
+    <html:div class="lft-row">
+      <html:label class="lft-label" for="lft-api-base">接口地址</html:label>
+      <html:input id="lft-api-base" class="lft-input" type="text" placeholder="https://api.deepseek.com"/>
+    </html:div>
+    <html:div class="lft-hint">OpenAI 兼容接口基址，实际请求 {接口地址}/chat/completions。切换服务商会自动填入该服务商的默认地址。</html:div>
+
+    <html:div class="lft-row">
+      <html:label class="lft-label" for="lft-model">模型</html:label>
+      <html:input id="lft-model" class="lft-input" type="text" list="lft-model-list" placeholder="deepseek-v4-flash"/>
+      <html:button id="lft-refresh-models" class="lft-button" type="button">刷新模型列表</html:button>
+      <html:span id="lft-model-status" class="lft-status"></html:span>
+    </html:div>
+    <html:datalist id="lft-model-list"></html:datalist>
+    <html:div class="lft-hint">可直接输入任意模型名，也可以点「刷新模型列表」从服务商的 /models 接口读取。</html:div>
+
+    <html:div class="lft-row">
+      <html:label class="lft-label" for="lft-api-key">API Key</html:label>
+      <html:input id="lft-api-key" class="lft-input" type="password" placeholder="sk-..."/>
+    </html:div>
+    <html:div id="lft-api-key-hint" class="lft-hint"></html:div>
+  </groupbox>
+
+  <groupbox>
+    <html:div class="lft-title">翻译选项</html:div>
+
+    <html:div class="lft-row">
+      <html:label class="lft-label" for="lft-mineru-root">MinerU 根目录</html:label>
+      <html:input id="lft-mineru-root" class="lft-input" type="text"/>
+    </html:div>
+    <html:div class="lft-hint">解析结果根目录，插件按 &lt;附件 ID&gt; 子目录定位 full.md，译文 .zh.md 也写回该目录。</html:div>
+
+    <html:label class="lft-check">
+      <html:input id="lft-overwrite" type="checkbox"/>
+      <html:span>覆盖已存在的 .zh.md 译文</html:span>
+    </html:label>
+    <html:label class="lft-check">
+      <html:input id="lft-skip-references" type="checkbox"/>
+      <html:span>跳过 References / Bibliography 章节</html:span>
+    </html:label>
+  </groupbox>
+
+  <html:div class="lft-hint" style="margin-left: 4px;">
+    服务商与模型选项与 llm-for-zotero 插件的「AI 服务商」保持一致。其余参数（超时、重试次数、分段长度、max_tokens 等）可在 高级 → 配置编辑器 里用 extensions.llm-for-zotero-translator. 前缀调整。
+  </html:div>
+</vbox>

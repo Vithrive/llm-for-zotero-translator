@@ -160,6 +160,7 @@ function makeReaderDocument(withToolbar) {
 // ---------------------------------------------------------------- Zotero 桩
 function makeContext(readerDoc, reader) {
   const listeners = [];
+  const registeredPanes = [];
   const customSections = readerDoc && readerDoc.querySelectorAll('.toolbar .end .custom-sections')[0];
   const sandbox = {
     console,
@@ -193,6 +194,12 @@ function makeContext(readerDoc, reader) {
           if (i >= 0) listeners.splice(i, 1);
         },
       },
+      PreferencePanes: {
+        register(options) {
+          registeredPanes.push(options);
+          return Promise.resolve(options.id);
+        },
+      },
     },
   };
   sandbox.globalThis = sandbox;
@@ -213,7 +220,7 @@ function makeContext(readerDoc, reader) {
     },
     listeners,
   };
-  return { sandbox, dispatchers };
+  return { sandbox, dispatchers, registeredPanes };
 }
 
 function loadPlugin(sandbox) {
@@ -229,9 +236,15 @@ function loadPlugin(sandbox) {
   {
     const readerDoc = makeReaderDocument(true);
     const reader = { _iframeWindow: { document: readerDoc } };
-    const { sandbox, dispatchers } = makeContext(readerDoc, reader);
+    const { sandbox, dispatchers, registeredPanes } = makeContext(readerDoc, reader);
     const plugin = loadPlugin(sandbox);
     await plugin.hooks.onStartup();
+
+    check('注册了「编辑 → 设置」面板',
+      registeredPanes.length === 1 &&
+      registeredPanes[0].pluginID === 'llm-for-zotero-translator@cszr' &&
+      /preferences\.xhtml$/.test(String(registeredPanes[0].src)),
+      JSON.stringify(registeredPanes.map((p) => [p.pluginID, p.src])));
 
     check('注册了 renderToolbar 监听（pluginID 正确）',
       dispatchers.listeners.length === 1 &&
