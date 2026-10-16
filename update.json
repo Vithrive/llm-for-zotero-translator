@@ -1,0 +1,12 @@
+{
+  "addons": {
+    "llm-for-zotero-translator@cszr": {
+      "updates": [
+        {
+          "version": "0.2.0",
+          "update_link": "https://github.com/Vithrive/llm-for-zotero-translator/releases/download/release/llm-for-zotero-translator.xpi"
+        }
+      ]
+    }
+  }
+}

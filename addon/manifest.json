@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "LLM for Zotero Translator",
+  "version": "0.2.0",
+  "description": "Translate MinerU parsed markdown into Chinese via DeepSeek in the Zotero PDF reader (companion add-on for llm-for-zotero)",
+  "homepage_url": "https://github.com/Vithrive/llm-for-zotero-translator",
+  "author": "cszr",
+  "icons": {
+    "48": "chrome/content/icons/icon.png"
+  },
+  "applications": {
+    "zotero": {
+      "id": "llm-for-zotero-translator@cszr",
+      "update_url": "https://github.com/Vithrive/llm-for-zotero-translator/releases/download/release/update.json",
+      "strict_min_version": "7.999",
+      "strict_max_version": "100.*.*"
+    }
+  }
+}
