@@ -83,7 +83,10 @@ var LlmForZoteroTranslator = (() => {
       id: "glm",
       label: "GLM",
       apiBase: "https://open.bigmodel.cn/api/paas/v4",
-      models: ["glm-4.6", "glm-4.5", "glm-4.5-air"],
+      // 智谱「编码套餐」的额度只在 coding 端点上生效（标准 paas/v4 会报 1113 余额不足），
+      // 命中配额类错误时自动改用备用端点，见 requestChatCompletion
+      fallbackApiBases: ["https://open.bigmodel.cn/api/coding/paas/v4"],
+      models: ["glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-4.6"],
       thinkingParam: true,
     },
     {
@@ -153,14 +156,16 @@ var LlmForZoteroTranslator = (() => {
     );
   }
 
-  // 接口地址：用户填过就用用户的，否则用服务商预设值
-  function resolveApiBase(providerId, prefBaseUrl) {
+  // 接口地址优先级：本次运行已探明的可用地址 > 用户设置 > 服务商预设
+  function resolveApiBase(providerId, prefBaseUrl, sessionBaseUrl) {
     const preset = getProviderPreset(providerId);
-    const fromPref = String(prefBaseUrl || "").trim().replace(/\/+$/, "");
-    if (fromPref) {
-      return fromPref;
+    for (const candidate of [sessionBaseUrl, prefBaseUrl, preset.apiBase]) {
+      const value = String(candidate || "").trim().replace(/\/+$/, "");
+      if (value) {
+        return value;
+      }
     }
-    return String(preset.apiBase || "").replace(/\/+$/, "");
+    return "";
   }
 
   const state = {
@@ -169,6 +174,8 @@ var LlmForZoteroTranslator = (() => {
     busyKeys: new Set(),
     // 已确认「不支持关闭 thinking」的 服务商:模型，避免每次请求都先撞一次 400
     thinkingUnsupported: new Set(),
+    // 本次运行探明的可用接口地址（服务商 id -> 地址），例如智谱编码套餐的 coding 端点
+    baseOverrides: new Map(),
     // 最近一次请求失败的原因（翻译结束时展示给用户，而不是只写 debug 日志）
     lastRequestError: "",
   };
@@ -228,7 +235,11 @@ var LlmForZoteroTranslator = (() => {
       providerLabel: preset.label,
       requiresApiKey: preset.requiresApiKey !== false,
       usesThinkingParam: !!preset.thinkingParam, // 只有部分服务商支持 thinking 参数
-      baseUrl: resolveApiBase(preset.id, getPref("baseUrl", DEFAULTS.baseUrl)),
+      baseUrl: resolveApiBase(
+        preset.id,
+        getPref("baseUrl", DEFAULTS.baseUrl),
+        state.baseOverrides.get(preset.id),
+      ),
       model: String(getPref("model", DEFAULTS.model)),
       maxSegmentChars: Number(getPref("maxSegmentChars", DEFAULTS.maxSegmentChars)) || DEFAULTS.maxSegmentChars,
       timeout: Number(getPref("timeout", DEFAULTS.timeout)) || DEFAULTS.timeout,
@@ -587,11 +598,25 @@ var LlmForZoteroTranslator = (() => {
     }
   }
 
+  // 配额类错误：同一把 key 在不同渠道/端点上可能分别计费
+  // （例如智谱标准 API 与「编码套餐」coding 端点各算各的额度）
+  function isQuotaError(status, detail) {
+    if (![400, 402, 403, 429].includes(status)) {
+      return false;
+    }
+    return /1113|余额不足|资源包|quota|balance|insufficient|billing/i.test(detail);
+  }
+
   async function requestChatCompletion(messages, config) {
-    const url = config.baseUrl + "/chat/completions";
+    const preset = getProviderPreset(config.provider);
+    // 服务商声明的备用端点（如智谱编码套餐），只在配额类错误时尝试
+    const fallbackBases = (preset.fallbackApiBases || [])
+      .map((base) => String(base || "").trim().replace(/\/+$/, ""))
+      .filter((base) => base && base !== config.baseUrl);
+    let baseUrl = config.baseUrl;
     const modelKey = config.provider + ":" + config.model;
-    // 只允许一次自适应调整（去掉 thinking / 降低 max_tokens），避免重试退化成死循环
-    let allowAdapt = true;
+    // 三种自适应各自最多触发一次（去 thinking / 降 max_tokens / 换备用端点），
+    // 因此 attempt-=1 不会导致无限循环
     let thinking =
       config.thinkingDisabled &&
       config.usesThinkingParam &&
@@ -618,7 +643,7 @@ var LlmForZoteroTranslator = (() => {
     for (let attempt = 0; attempt < config.retryCount; attempt += 1) {
       try {
         const response = await fetchWithTimeout(
-          url,
+          baseUrl + "/chat/completions",
           {
             method: "POST",
             headers: buildRequestHeaders(config),
@@ -630,23 +655,29 @@ var LlmForZoteroTranslator = (() => {
         const rawText = await response.text();
         if (!response.ok) {
           const detail = parseErrorPayload(rawText);
-          if (allowAdapt && response.status === 400 && /thinking|思考/i.test(detail)) {
-            allowAdapt = false;
-            if (thinking) {
-              thinking = false;
-              state.thinkingUnsupported.add(modelKey);
-              log("该模型不接受关闭 thinking，改为不发送该参数：" + modelKey);
-              attempt -= 1; // 自适应调整不占用重试次数
-              continue;
-            }
+          // 当前端点配额不可用时，换用服务商声明的备用端点（如智谱编码套餐）
+          if (isQuotaError(response.status, detail) && fallbackBases.length) {
+            const nextBase = fallbackBases.shift();
+            state.baseOverrides.set(preset.id, nextBase);
+            setPref("baseUrl", nextBase); // 设置面板里也会显示实际可用的地址
+            log("当前端点配额不可用，自动改用备用端点：" + nextBase);
+            notify("MinerU 翻译", preset.label + " 已自动改用可用端点：" + nextBase);
+            baseUrl = nextBase;
+            attempt -= 1;
+            continue;
+          }
+          if (response.status === 400 && /thinking|思考/i.test(detail) && thinking) {
+            thinking = false;
+            state.thinkingUnsupported.add(modelKey);
+            log("该模型不接受关闭 thinking，改为不发送该参数：" + modelKey);
+            attempt -= 1; // 自适应调整不占用重试次数
+            continue;
           }
           if (
-            allowAdapt &&
             response.status === 400 &&
             /max_tokens|max output|输出长度/i.test(detail) &&
             maxTokens > 4096
           ) {
-            allowAdapt = false;
             maxTokens = 4096;
             log("max_tokens 被拒绝，降为 4096 重试：" + modelKey);
             attempt -= 1;
@@ -1340,7 +1371,10 @@ var LlmForZoteroTranslator = (() => {
       return "自定义：请填写 OpenAI 兼容接口基址，例如 http://localhost:8000/v1";
     }
     const keyNote = preset.requiresApiKey === false ? "，通常无需 API Key" : "";
-    return "请求地址：" + preset.apiBase + "/chat/completions" + keyNote;
+    const fallbackNote = preset.fallbackApiBases?.length
+      ? "；若账户用的是编码套餐，会自动改用 " + preset.fallbackApiBases[0]
+      : "";
+    return "请求地址：" + preset.apiBase + "/chat/completions" + keyNote + fallbackNote;
   }
 
   // 用服务商自己的 /models 接口拉取模型清单（拿不到就保留预设候选）

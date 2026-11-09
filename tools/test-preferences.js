@@ -251,7 +251,10 @@ function sequenceFetch(responses) {
     check('MinerU 根目录回填', doc.getElementById(FIELD_IDS.mineruRoot).value === 'D:\\MinerU');
     check('覆盖勾选框回填', doc.getElementById(FIELD_IDS.overwrite).checked === true);
     check('跳过文献勾选框回填', doc.getElementById(FIELD_IDS.skipReferences).checked === false);
-    check('模型候选来自当前服务商（GLM）', doc.getElementById(FIELD_IDS.modelList).children.length === 3);
+    check('模型候选来自当前服务商（GLM）',
+      doc.getElementById(FIELD_IDS.modelList).children.length ===
+        plugin._internal.getProviderPreset('glm').models.length,
+      String(doc.getElementById(FIELD_IDS.modelList).children.length));
     check('服务商提示含请求地址', /\/chat\/completions/.test(doc.getElementById(FIELD_IDS.providerHint).textContent));
   }
 
@@ -501,6 +504,36 @@ function sequenceFetch(responses) {
     check('最近失败原因已记录',
       /余额不足/.test(plugin._internal.getLastRequestError()),
       plugin._internal.getLastRequestError());
+  }
+
+  // 用例 12：配额只在特定端点生效时（智谱编码套餐）自动切换备用端点
+  {
+    const quota = jsonResponse(
+      { error: { code: '1113', message: '余额不足或无可用资源包,请充值。' } },
+      { ok: false, status: 429 });
+    const okResp = jsonResponse({ choices: [{ message: { content: '译文' } }] });
+    const prefs = new Map([
+      [PREF_BRANCH + 'provider', 'glm'],
+      [PREF_BRANCH + 'apiKey', 'sk-glm'],
+      [PREF_BRANCH + 'model', 'glm-5.3-flash'],
+    ]);
+    const fetchImpl = sequenceFetch([quota, okResp]);
+    const { sandbox } = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs, fetchImpl });
+    const plugin = loadPlugin(sandbox);
+    const config = plugin._internal.getConfig();
+    check('GLM 默认端点仍是标准 API', config.baseUrl === 'https://open.bigmodel.cn/api/paas/v4', config.baseUrl);
+
+    const text = await plugin._internal.requestChatCompletion([{ role: 'user', content: 'hi' }], config);
+    check('配额错误后自动换端点并成功', text === '译文', text);
+    check('第二次请求打到 coding 端点',
+      fetchImpl.calls[1] && fetchImpl.calls[1].url === 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
+      fetchImpl.calls[1] && fetchImpl.calls[1].url);
+    check('可用端点写回偏好（设置面板可见）',
+      prefs.get(PREF_BRANCH + 'baseUrl') === 'https://open.bigmodel.cn/api/coding/paas/v4',
+      prefs.get(PREF_BRANCH + 'baseUrl'));
+    check('同一次运行内后续请求直接用可用端点',
+      plugin._internal.getConfig().baseUrl === 'https://open.bigmodel.cn/api/coding/paas/v4',
+      plugin._internal.getConfig().baseUrl);
   }
 
   console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURE(S)');
