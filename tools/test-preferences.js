@@ -170,6 +170,17 @@ function jsonResponse(payload, { ok = true, status = 200 } = {}) {
   return { ok, status, text: async () => JSON.stringify(payload) };
 }
 
+// 按调用顺序返回不同响应（用完后重复最后一个）
+function sequenceFetch(responses) {
+  const calls = [];
+  const impl = async (url, options) => {
+    calls.push({ url, options });
+    return responses[Math.min(calls.length - 1, responses.length - 1)];
+  };
+  impl.calls = calls;
+  return impl;
+}
+
 // ---------------------------------------------------------------- 用例
 (async () => {
   const paneSource = fs.readFileSync(PANE_XHTML, 'utf8');
@@ -427,6 +438,69 @@ function jsonResponse(payload, { ok = true, status = 200 } = {}) {
       check('自定义接口地址优先', plugin._internal.getConfig().baseUrl === 'http://127.0.0.1:9999/v1',
         plugin._internal.getConfig().baseUrl);
     }
+  }
+
+  // 用例 10：模型不接受「关闭 thinking」时自动去掉该参数（glm-5.3-flash 这类始终思考的模型）
+  {
+    const thinkingRejected = jsonResponse(
+      { error: { code: '1210', message: '该模型始终思考，不支持关闭思考；请使用 low、high 或 max。' } },
+      { ok: false, status: 400 });
+    const okResp = jsonResponse({ choices: [{ message: { content: '译文 OK' } }] });
+    const prefs = new Map([
+      [PREF_BRANCH + 'provider', 'glm'],
+      [PREF_BRANCH + 'apiKey', 'sk-glm'],
+      [PREF_BRANCH + 'model', 'glm-5.3-flash'],
+    ]);
+    const fetchImpl = sequenceFetch([thinkingRejected, okResp]);
+    const { sandbox } = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs, fetchImpl });
+    const plugin = loadPlugin(sandbox);
+    const config = plugin._internal.getConfig();
+
+    const text = await plugin._internal.requestChatCompletion([{ role: 'user', content: 'hi' }], config);
+    check('thinking 被拒后自动重试并成功', text === '译文 OK', text);
+    check('自适应只多花 1 次请求', fetchImpl.calls.length === 2, String(fetchImpl.calls.length));
+    const firstBody = JSON.parse(fetchImpl.calls[0].options.body);
+    const secondBody = JSON.parse(fetchImpl.calls[1].options.body);
+    check('首次请求带 thinking:disabled', firstBody.thinking && firstBody.thinking.type === 'disabled');
+    check('重试请求已去掉 thinking', secondBody.thinking === undefined);
+    check('已记住该模型不支持 thinking',
+      plugin._internal.getThinkingUnsupported().includes('glm:glm-5.3-flash'),
+      JSON.stringify(plugin._internal.getThinkingUnsupported()));
+
+    // 同一模型的后续请求应一开始就不带 thinking
+    const fetchNext = sequenceFetch([okResp]);
+    sandbox.fetch = fetchNext;
+    await plugin._internal.requestChatCompletion([{ role: 'user', content: 'hi again' }], config);
+    check('后续请求不再发 thinking', fetchNext.calls.length === 1 &&
+      JSON.parse(fetchNext.calls[0].options.body).thinking === undefined,
+      String(fetchNext.calls.length));
+  }
+
+  // 用例 11：余额不足等错误要保留服务商原始说明（而不是只变成占位符）
+  {
+    const quotaError = jsonResponse(
+      { error: { code: '1113', message: '余额不足或无可用资源包,请充值。' } },
+      { ok: false, status: 429 });
+    const fetchImpl = sequenceFetch([quotaError]);
+    const prefs = new Map([
+      [PREF_BRANCH + 'provider', 'glm'],
+      [PREF_BRANCH + 'apiKey', 'sk-glm'],
+      [PREF_BRANCH + 'model', 'glm-5.3-flash'],
+    ]);
+    const { sandbox } = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs, fetchImpl });
+    const plugin = loadPlugin(sandbox);
+    let err = null;
+    try {
+      await plugin._internal.requestChatCompletion([{ role: 'user', content: 'hi' }], plugin._internal.getConfig());
+    } catch (error) {
+      err = error;
+    }
+    check('HTTP 429 会抛出异常', !!err);
+    check('异常信息保留服务商原始说明', /余额不足/.test(String(err && err.message)), String(err && err.message).split('\n')[0]);
+    check('异常信息带状态码', /429/.test(String(err && err.message)));
+    check('最近失败原因已记录',
+      /余额不足/.test(plugin._internal.getLastRequestError()),
+      plugin._internal.getLastRequestError());
   }
 
   console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURE(S)');

@@ -167,6 +167,10 @@ var LlmForZoteroTranslator = (() => {
     windows: new Map(),
     intervalID: null,
     busyKeys: new Set(),
+    // 已确认「不支持关闭 thinking」的 服务商:模型，避免每次请求都先撞一次 400
+    thinkingUnsupported: new Set(),
+    // 最近一次请求失败的原因（翻译结束时展示给用户，而不是只写 debug 日志）
+    lastRequestError: "",
   };
 
   // ---------------------------------------------------------------------------
@@ -573,19 +577,42 @@ var LlmForZoteroTranslator = (() => {
     return headers;
   }
 
+  // 从错误响应里取人能看懂的原因（各家结构大同小异）
+  function parseErrorPayload(rawText) {
+    try {
+      const payload = JSON.parse(rawText);
+      return String(payload?.error?.message || payload?.message || rawText || "").trim();
+    } catch (_error) {
+      return String(rawText || "").trim();
+    }
+  }
+
   async function requestChatCompletion(messages, config) {
     const url = config.baseUrl + "/chat/completions";
-    const body = {
-      model: config.model,
-      temperature: 0.1,
-      messages,
-      stream: false,
-      max_tokens: config.maxTokens,
+    const modelKey = config.provider + ":" + config.model;
+    // 只允许一次自适应调整（去掉 thinking / 降低 max_tokens），避免重试退化成死循环
+    let allowAdapt = true;
+    let thinking =
+      config.thinkingDisabled &&
+      config.usesThinkingParam &&
+      !state.thinkingUnsupported.has(modelKey);
+    let maxTokens = config.maxTokens;
+
+    const buildBody = () => {
+      const body = {
+        model: config.model,
+        temperature: 0.1,
+        messages,
+        stream: false,
+        max_tokens: maxTokens,
+      };
+      // thinking 参数只有部分服务商的兼容接口支持；有的模型（如 glm-5.3-flash）
+      // 本身就是「始终思考」，传 disabled 会被直接拒绝（HTTP 400 / code 1210）
+      if (thinking) {
+        body.thinking = { type: "disabled" };
+      }
+      return body;
     };
-    // thinking 参数只有部分服务商（DeepSeek / GLM 等）的兼容接口支持，其它服务商不发
-    if (config.thinkingDisabled && config.usesThinkingParam) {
-      body.thinking = { type: "disabled" };
-    }
 
     let lastError = null;
     for (let attempt = 0; attempt < config.retryCount; attempt += 1) {
@@ -595,23 +622,44 @@ var LlmForZoteroTranslator = (() => {
           {
             method: "POST",
             headers: buildRequestHeaders(config),
-            body: JSON.stringify(body),
+            body: JSON.stringify(buildBody()),
           },
           config.timeout,
         );
 
         const rawText = await response.text();
         if (!response.ok) {
-          let detail = rawText || "";
-          try {
-            const payload = JSON.parse(rawText);
-            detail = payload.error?.message || payload.message || rawText;
-          } catch (_error) {}
-          throw new Error(
+          const detail = parseErrorPayload(rawText);
+          if (allowAdapt && response.status === 400 && /thinking|思考/i.test(detail)) {
+            allowAdapt = false;
+            if (thinking) {
+              thinking = false;
+              state.thinkingUnsupported.add(modelKey);
+              log("该模型不接受关闭 thinking，改为不发送该参数：" + modelKey);
+              attempt -= 1; // 自适应调整不占用重试次数
+              continue;
+            }
+          }
+          if (
+            allowAdapt &&
+            response.status === 400 &&
+            /max_tokens|max output|输出长度/i.test(detail) &&
+            maxTokens > 4096
+          ) {
+            allowAdapt = false;
+            maxTokens = 4096;
+            log("max_tokens 被拒绝，降为 4096 重试：" + modelKey);
+            attempt -= 1;
+            continue;
+          }
+          const error = new Error(
             "HTTP " + response.status + ": " + detail +
               "\nModel: " + config.model +
               "\nAPI Key: " + maskApiKey(config.apiKey),
           );
+          error.status = response.status;
+          error.detail = detail;
+          throw error;
         }
 
         let payload;
@@ -631,9 +679,11 @@ var LlmForZoteroTranslator = (() => {
         if (!text) {
           throw new Error("空响应：" + rawText.slice(0, 300));
         }
+        state.lastRequestError = "";
         return text;
       } catch (error) {
         lastError = error;
+        state.lastRequestError = error.detail || String(error.message || error).split("\n")[0];
         log("翻译请求失败（第 " + (attempt + 1) + " 次）", error);
       }
     }
@@ -661,17 +711,21 @@ var LlmForZoteroTranslator = (() => {
       { role: "user", content: buildTranslationPrompt(text) },
     ];
     let translated = null;
+    let failed = false;
     try {
       translated = await requestChatCompletion(messages, config);
     } catch (error) {
       log("分段翻译失败，使用占位译文", error);
       translated = buildFailedTranslationText(text);
+      failed = true;
     }
     if (!translated || !translated.trim()) {
       translated = buildFailedTranslationText(text);
+      failed = true;
     }
-    cache.set(text, translated);
-    return translated;
+    const result = { text: translated, failed };
+    cache.set(text, result);
+    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -692,13 +746,14 @@ var LlmForZoteroTranslator = (() => {
 
   async function translateMarkdown(content, config, onProgress) {
     if (!isEnglish(content)) {
-      return { text: content, translatedSegments: 0, skipped: true };
+      return { text: content, translatedSegments: 0, failedSegments: 0, skipped: true };
     }
     const { text: protectedText, bucket } = protectSpecialContent(content);
     const sections = splitSections(protectedText);
     const cache = new Map();
     const outputParts = [];
     let translatedSegments = 0;
+    let failedSegments = 0;
     let lastRole = null;
 
     for (let s = 0; s < sections.length; s += 1) {
@@ -714,8 +769,12 @@ var LlmForZoteroTranslator = (() => {
         for (const block of blocks) {
           let out;
           if (block.kind === "translate") {
-            out = await translateSegment(block.content, config, cache);
+            const segment = await translateSegment(block.content, config, cache);
+            out = segment.text;
             translatedSegments += 1;
+            if (segment.failed) {
+              failedSegments += 1;
+            }
             if (onProgress) {
               onProgress(translatedSegments, s + 1, sections.length);
             }
@@ -732,7 +791,7 @@ var LlmForZoteroTranslator = (() => {
       outputParts.push(restoreSpecialContent(sectionOutput, bucket));
       lastRole = null;
     }
-    return { text: outputParts.join(""), translatedSegments, skipped: false };
+    return { text: outputParts.join(""), translatedSegments, failedSegments, skipped: false };
   }
 
   // ---------------------------------------------------------------------------
@@ -813,6 +872,17 @@ var LlmForZoteroTranslator = (() => {
 
     await writeTextFile(outputPath, ""); // 先建空文件，异常时也能看到进度
     const result = await translateMarkdown(content, config, onProgress);
+    // 全部失败时不落盘：避免生成一份满是 [引擎翻译问题] 的 .zh.md
+    if (result.translatedSegments > 0 && result.failedSegments >= result.translatedSegments) {
+      return {
+        status: "failed",
+        title,
+        dir: workdir,
+        translatedSegments: result.translatedSegments,
+        failedSegments: result.failedSegments,
+        reason: "全部 " + result.failedSegments + " 段失败：" + (state.lastRequestError || "请求失败"),
+      };
+    }
     await writeTextFile(outputPath, result.text);
     return {
       status: "done",
@@ -820,6 +890,7 @@ var LlmForZoteroTranslator = (() => {
       output: outputPath,
       dir: workdir,
       translatedSegments: result.translatedSegments,
+      failedSegments: result.failedSegments,
     };
   }
 
@@ -847,6 +918,7 @@ var LlmForZoteroTranslator = (() => {
       );
       return null;
     }
+    state.lastRequestError = "";
 
     const attachments = await getPDFAttachmentsFromItem(item);
     if (!attachments.length) {
@@ -879,11 +951,24 @@ var LlmForZoteroTranslator = (() => {
     if (results.length) {
       const lines = results.map((result) => {
         if (result.status === "done") {
-          return (result.title || "附件 " + result.dir) + "：已生成译文（" + result.translatedSegments + " 段）";
+          let line = (result.title || "附件 " + result.dir) +
+            "：已生成译文（" + result.translatedSegments + " 段）";
+          if (result.failedSegments) {
+            line += "，其中 " + result.failedSegments + " 段失败";
+          }
+          return line;
         }
         return (result.title || "附件 " + result.dir) + "：" + (result.reason || result.status);
       });
-      notify("MinerU 翻译完成", lines);
+      const failedTotal = results.reduce(
+        (sum, result) => sum + (result.failedSegments || 0),
+        0,
+      );
+      if (failedTotal && state.lastRequestError) {
+        lines.push("失败原因（" + config.providerLabel + " / " + config.model + "）：" + state.lastRequestError);
+      }
+      const allFailed = results.every((result) => result.status === "failed");
+      notify(allFailed ? "MinerU 翻译失败" : "MinerU 翻译完成", lines);
     }
     return results;
   }
@@ -1506,6 +1591,8 @@ var LlmForZoteroTranslator = (() => {
       getConfig,
       requestChatCompletion,
       refreshModelList,
+      getLastRequestError: () => state.lastRequestError,
+      getThinkingUnsupported: () => Array.from(state.thinkingUnsupported),
     },
   };
 })();
