@@ -82,10 +82,11 @@ var LlmForZoteroTranslator = (() => {
     {
       id: "glm",
       label: "GLM",
-      apiBase: "https://open.bigmodel.cn/api/paas/v4",
-      // 智谱「编码套餐」的额度只在 coding 端点上生效（标准 paas/v4 会报 1113 余额不足），
-      // 命中配额类错误时自动改用备用端点，见 requestChatCompletion
-      fallbackApiBases: ["https://open.bigmodel.cn/api/coding/paas/v4"],
+      // 智谱「编码套餐」的额度只在 coding 端点上生效：标准 api/paas/v4 会返回
+      // 429/1113「余额不足或无可用资源包」，所以这里固定用 coding 端点
+      apiBase: "https://open.bigmodel.cn/api/coding/paas/v4",
+      // 旧默认地址：升级时用它把已保存的 baseUrl 迁移掉
+      legacyApiBases: ["https://open.bigmodel.cn/api/paas/v4"],
       models: ["glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-4.6"],
       thinkingParam: true,
     },
@@ -156,16 +157,27 @@ var LlmForZoteroTranslator = (() => {
     );
   }
 
-  // 接口地址优先级：本次运行已探明的可用地址 > 用户设置 > 服务商预设
-  function resolveApiBase(providerId, prefBaseUrl, sessionBaseUrl) {
+  // 接口地址：用户填过就用用户的，否则用服务商预设值
+  function resolveApiBase(providerId, prefBaseUrl) {
     const preset = getProviderPreset(providerId);
-    for (const candidate of [sessionBaseUrl, prefBaseUrl, preset.apiBase]) {
-      const value = String(candidate || "").trim().replace(/\/+$/, "");
-      if (value) {
-        return value;
-      }
+    const fromPref = String(prefBaseUrl || "").trim().replace(/\/+$/, "");
+    if (fromPref) {
+      return fromPref;
     }
-    return "";
+    return String(preset.apiBase || "").replace(/\/+$/, "");
+  }
+
+  // 服务商默认地址改过之后，把偏好里存的旧默认值替换掉（只认预设声明的旧地址，
+  // 不会覆盖用户自己填的自定义地址）
+  function migrateLegacyApiBases() {
+    const preset = getProviderPreset(getPref("provider", DEFAULTS.provider));
+    const legacy = (preset.legacyApiBases || []).map((base) =>
+      String(base || "").trim().replace(/\/+$/, ""));
+    const current = String(getPref("baseUrl", DEFAULTS.baseUrl) || "").trim().replace(/\/+$/, "");
+    if (current && legacy.includes(current)) {
+      setPref("baseUrl", preset.apiBase);
+      log("已把 " + preset.label + " 的旧接口地址迁移为 " + preset.apiBase);
+    }
   }
 
   const state = {
@@ -174,8 +186,6 @@ var LlmForZoteroTranslator = (() => {
     busyKeys: new Set(),
     // 已确认「不支持关闭 thinking」的 服务商:模型，避免每次请求都先撞一次 400
     thinkingUnsupported: new Set(),
-    // 本次运行探明的可用接口地址（服务商 id -> 地址），例如智谱编码套餐的 coding 端点
-    baseOverrides: new Map(),
     // 最近一次请求失败的原因（翻译结束时展示给用户，而不是只写 debug 日志）
     lastRequestError: "",
   };
@@ -235,11 +245,7 @@ var LlmForZoteroTranslator = (() => {
       providerLabel: preset.label,
       requiresApiKey: preset.requiresApiKey !== false,
       usesThinkingParam: !!preset.thinkingParam, // 只有部分服务商支持 thinking 参数
-      baseUrl: resolveApiBase(
-        preset.id,
-        getPref("baseUrl", DEFAULTS.baseUrl),
-        state.baseOverrides.get(preset.id),
-      ),
+      baseUrl: resolveApiBase(preset.id, getPref("baseUrl", DEFAULTS.baseUrl)),
       model: String(getPref("model", DEFAULTS.model)),
       maxSegmentChars: Number(getPref("maxSegmentChars", DEFAULTS.maxSegmentChars)) || DEFAULTS.maxSegmentChars,
       timeout: Number(getPref("timeout", DEFAULTS.timeout)) || DEFAULTS.timeout,
@@ -598,24 +604,10 @@ var LlmForZoteroTranslator = (() => {
     }
   }
 
-  // 配额类错误：同一把 key 在不同渠道/端点上可能分别计费
-  // （例如智谱标准 API 与「编码套餐」coding 端点各算各的额度）
-  function isQuotaError(status, detail) {
-    if (![400, 402, 403, 429].includes(status)) {
-      return false;
-    }
-    return /1113|余额不足|资源包|quota|balance|insufficient|billing/i.test(detail);
-  }
-
   async function requestChatCompletion(messages, config) {
-    const preset = getProviderPreset(config.provider);
-    // 服务商声明的备用端点（如智谱编码套餐），只在配额类错误时尝试
-    const fallbackBases = (preset.fallbackApiBases || [])
-      .map((base) => String(base || "").trim().replace(/\/+$/, ""))
-      .filter((base) => base && base !== config.baseUrl);
-    let baseUrl = config.baseUrl;
+    const url = config.baseUrl + "/chat/completions";
     const modelKey = config.provider + ":" + config.model;
-    // 三种自适应各自最多触发一次（去 thinking / 降 max_tokens / 换备用端点），
+    // 两种参数自适应各自最多触发一次（去 thinking / 降 max_tokens），
     // 因此 attempt-=1 不会导致无限循环
     let thinking =
       config.thinkingDisabled &&
@@ -643,7 +635,7 @@ var LlmForZoteroTranslator = (() => {
     for (let attempt = 0; attempt < config.retryCount; attempt += 1) {
       try {
         const response = await fetchWithTimeout(
-          baseUrl + "/chat/completions",
+          url,
           {
             method: "POST",
             headers: buildRequestHeaders(config),
@@ -655,17 +647,6 @@ var LlmForZoteroTranslator = (() => {
         const rawText = await response.text();
         if (!response.ok) {
           const detail = parseErrorPayload(rawText);
-          // 当前端点配额不可用时，换用服务商声明的备用端点（如智谱编码套餐）
-          if (isQuotaError(response.status, detail) && fallbackBases.length) {
-            const nextBase = fallbackBases.shift();
-            state.baseOverrides.set(preset.id, nextBase);
-            setPref("baseUrl", nextBase); // 设置面板里也会显示实际可用的地址
-            log("当前端点配额不可用，自动改用备用端点：" + nextBase);
-            notify("MinerU 翻译", preset.label + " 已自动改用可用端点：" + nextBase);
-            baseUrl = nextBase;
-            attempt -= 1;
-            continue;
-          }
           if (response.status === 400 && /thinking|思考/i.test(detail) && thinking) {
             thinking = false;
             state.thinkingUnsupported.add(modelKey);
@@ -1371,10 +1352,7 @@ var LlmForZoteroTranslator = (() => {
       return "自定义：请填写 OpenAI 兼容接口基址，例如 http://localhost:8000/v1";
     }
     const keyNote = preset.requiresApiKey === false ? "，通常无需 API Key" : "";
-    const fallbackNote = preset.fallbackApiBases?.length
-      ? "；若账户用的是编码套餐，会自动改用 " + preset.fallbackApiBases[0]
-      : "";
-    return "请求地址：" + preset.apiBase + "/chat/completions" + keyNote + fallbackNote;
+    return "请求地址：" + preset.apiBase + "/chat/completions" + keyNote;
   }
 
   // 用服务商自己的 /models 接口拉取模型清单（拿不到就保留预设候选）
@@ -1553,6 +1531,7 @@ var LlmForZoteroTranslator = (() => {
       Zotero.uiReadyPromise,
     ]);
     registerPrefsPane();
+    migrateLegacyApiBases();
     registerReaderToolbarButton();
     if (!state.intervalID) {
       state.intervalID = setInterval(() => {

@@ -506,34 +506,51 @@ function sequenceFetch(responses) {
       plugin._internal.getLastRequestError());
   }
 
-  // 用例 12：配额只在特定端点生效时（智谱编码套餐）自动切换备用端点
+  // 用例 12：GLM 固定使用 coding 端点（不试探标准端点）
   {
-    const quota = jsonResponse(
-      { error: { code: '1113', message: '余额不足或无可用资源包,请充值。' } },
-      { ok: false, status: 429 });
     const okResp = jsonResponse({ choices: [{ message: { content: '译文' } }] });
+    const fetchImpl = captureFetch(okResp);
     const prefs = new Map([
       [PREF_BRANCH + 'provider', 'glm'],
       [PREF_BRANCH + 'apiKey', 'sk-glm'],
       [PREF_BRANCH + 'model', 'glm-5.3-flash'],
     ]);
-    const fetchImpl = sequenceFetch([quota, okResp]);
     const { sandbox } = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs, fetchImpl });
     const plugin = loadPlugin(sandbox);
     const config = plugin._internal.getConfig();
-    check('GLM 默认端点仍是标准 API', config.baseUrl === 'https://open.bigmodel.cn/api/paas/v4', config.baseUrl);
+    check('GLM 默认端点即 coding 端点',
+      config.baseUrl === 'https://open.bigmodel.cn/api/coding/paas/v4', config.baseUrl);
 
     const text = await plugin._internal.requestChatCompletion([{ role: 'user', content: 'hi' }], config);
-    check('配额错误后自动换端点并成功', text === '译文', text);
-    check('第二次请求打到 coding 端点',
-      fetchImpl.calls[1] && fetchImpl.calls[1].url === 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
-      fetchImpl.calls[1] && fetchImpl.calls[1].url);
-    check('可用端点写回偏好（设置面板可见）',
+    check('GLM 首次请求直接打到 coding 端点，不试探其它端点',
+      text === '译文' && fetchImpl.calls.length === 1 &&
+        fetchImpl.calls[0].url === 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
+      fetchImpl.calls.map((c) => c.url).join(' | '));
+  }
+
+  // 用例 13：升级时把 GLM 已保存的旧默认地址迁移到 coding 端点（自定义地址不动）
+  {
+    const prefs = new Map([
+      [PREF_BRANCH + 'provider', 'glm'],
+      [PREF_BRANCH + 'baseUrl', 'https://open.bigmodel.cn/api/paas/v4'],
+    ]);
+    const { sandbox } = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs });
+    const plugin = loadPlugin(sandbox);
+    await plugin.hooks.onStartup();
+    check('旧 GLM 默认地址已迁移为 coding 端点',
       prefs.get(PREF_BRANCH + 'baseUrl') === 'https://open.bigmodel.cn/api/coding/paas/v4',
       prefs.get(PREF_BRANCH + 'baseUrl'));
-    check('同一次运行内后续请求直接用可用端点',
-      plugin._internal.getConfig().baseUrl === 'https://open.bigmodel.cn/api/coding/paas/v4',
-      plugin._internal.getConfig().baseUrl);
+
+    const customPrefs = new Map([
+      [PREF_BRANCH + 'provider', 'glm'],
+      [PREF_BRANCH + 'baseUrl', 'https://my-gateway.example.com/v1'],
+    ]);
+    const customCtx = makeContext({ doc: makeDocument(Object.values(FIELD_IDS)), prefs: customPrefs });
+    const customPlugin = loadPlugin(customCtx.sandbox);
+    await customPlugin.hooks.onStartup();
+    check('用户自定义接口地址不会被迁移',
+      customPrefs.get(PREF_BRANCH + 'baseUrl') === 'https://my-gateway.example.com/v1',
+      customPrefs.get(PREF_BRANCH + 'baseUrl'));
   }
 
   console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILURE(S)');
